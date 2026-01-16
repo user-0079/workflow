@@ -1,0 +1,259 @@
+name: Docker Common CI template
+on:
+  workflow_call:
+    inputs:
+      ASSET_ID:
+        description: 'Asset ID'
+        type: string
+        required: true
+      
+     #ARTIFACORY DETAILS
+      ARTIFACTORY_DEFAULT_BRANCH:
+        description: 'TR jfrog branch name to use. If Blank, no branching strategy is applied'
+        type: string
+        default: "develop"
+        required: false
+        
+
+      #DOCKER DETAILS
+      DOCKER_FILE:
+        description: 'Docker File Location'
+        type: string
+        default: ""
+        required: false
+      ARTIFACTORY_DOCKER_HOST:
+        description: 'TR jfrog host'
+        type: string
+        default: "tr1-docker-local.jfrog.io"
+        required: false
+      ARTIFACTORY_DOCKER_REPO:
+        description: 'TR jfrog docker repo name. Works Only if DOCKER_FILE is provided'
+        type: string
+        default: ""
+        required: false
+      
+      #SYSDIG DETAILS
+      ENABLE_SYSDIG:
+        description: 'Enable Sysdig. Works Only if DOCKER_FILE is provided'
+        type: boolean
+        default: false
+        required: false
+        
+      # BRANCH DETAILS
+      MAIN_BRANCH:
+        description: 'Main Branch'
+        type: string
+        default: ""
+        required: false
+      TRIGGER_BRANCH:
+        description: 'Trigger Branch'
+        type: string
+        default: ""
+        required: false
+      RELEASE_BRANCH_PREFIX:
+        description: 'Release Branch Prefix'
+        type: string
+        default: "release"
+        required: false
+      
+      # NOTIFICATION DETAILS
+      MSTEAMS_WEBHOOK:
+        description: 'MS Teams Webhook'
+        type: string
+        default: ""
+        required: false    
+      
+      #Outputs
+      ACTION_INFO_FILE_NAME:
+        description: 'Action info File Name'
+        type: string
+        default: "action-info.json"
+        required: false
+      
+        
+    secrets:
+      ARTIFACTORY_USERNAME:
+        required: true
+      ARTIFACTORY_PASSWORD:
+        required: true
+      SYSDIG_TOKEN:
+        required: false
+
+env:
+  DOCKER_FILE: ${{inputs.DOCKER_FILE}}
+  TR_ARTIFACTORY_URL: "https://tr1.jfrog.io/artifactory"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - 
+      name: Check out
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - 
+      name: Get Datetime
+      id: time
+      uses: nanzm/get-time-action@v1.1
+      with:
+        timeZone: 0
+        format: 'YYYY-MM-DD-HH-mm-ss'
+    
+    - name: Setup ENV Variables
+      shell: sh
+      run: |
+        if [ ${{ inputs.MAIN_BRANCH }} != '' ]; then
+            MAIN_BRANCH_REF=refs/heads/${{inputs.MAIN_BRANCH}}
+        else
+            MAIN_BRANCH_REF=refs/heads/${{github.event.repository.default_branch}}
+        fi
+        echo "MAIN_BRANCH_REF=$MAIN_BRANCH_REF" >> $GITHUB_ENV
+        JFROG_BRANCH=''
+        JFROG_PATH=''
+        if [ ${{ inputs.ARTIFACTORY_DEFAULT_BRANCH }} != '' ]; then
+            case "${{ github.ref_name }}" in
+              ("${{inputs.RELEASE_BRANCH_PREFIX}}"*)
+                JFROG_BRANCH=release                
+                ;;
+              (*)
+                JFROG_BRANCH=${{ inputs.ARTIFACTORY_DEFAULT_BRANCH }}
+                ;;
+            esac
+            JFROG_PATH=/$JFROG_BRANCH
+        fi
+        echo "Variable JFROG_PATH set to $JFROG_PATH"      
+        echo "JFROG_BRANCH=$JFROG_BRANCH" >> $GITHUB_ENV              
+        if [ ${{ inputs.ARTIFACTORY_DOCKER_REPO }} != '' ]; then
+              echo "ARTIFACTORY_DOCKER_REPO=${{inputs.ARTIFACTORY_DOCKER_REPO}}$JFROG_PATH" >> $GITHUB_ENV
+              echo "ARTIFACTORY_FULL_DOCKER_REPO=${{inputs.ASSET_ID}}/${{inputs.ARTIFACTORY_DOCKER_REPO}}$JFROG_PATH" >> $GITHUB_ENV              
+        fi        
+    - name: Print ENV Variables
+      shell: sh
+      run: |
+          echo "Env Variable MAIN_BRANCH_REF set to ${{ env.MAIN_BRANCH_REF }}"
+          echo "Env Variable JFROG_BRANCH set to ${{ env.JFROG_BRANCH }}"
+          echo "Env Variable ARTIFACTORY_DOCKER_REPO set to ${{ env.ARTIFACTORY_DOCKER_REPO }}"
+          echo "Env Variable ARTIFACTORY_FULL_DOCKER_REPO set to ${{ env.ARTIFACTORY_FULL_DOCKER_REPO }}"          
+    
+    -
+      name: Generate Action Info
+      run: |                
+        actionInfoJson=$( jq -n --arg tag "${{ github.sha }}" '{tag: $tag,artifact:null,dockerimage:null}')
+        
+        ACTION_INFO_FILE=${{ inputs.ACTION_INFO_FILE_NAME}}
+        
+        echo $actionInfoJson | jq > $ACTION_INFO_FILE
+        
+        if [ ${{ env.DOCKER_FILE }} != '' ]; then
+            docker_image=${{inputs.ARTIFACTORY_DOCKER_HOST}}/${{ env.ARTIFACTORY_FULL_DOCKER_REPO }}
+            actionInfoJson=$(jq  --arg docker_image "$docker_image" '.dockerimage |= $docker_image' $ACTION_INFO_FILE)
+            echo $actionInfoJson | jq > $ACTION_INFO_FILE
+        fi
+        
+        cat $ACTION_INFO_FILE
+
+    -
+      name: Build Docker Image
+      if: env.DOCKER_FILE!='' && contains(fromJSON('["push"]'), github.event_name) && inputs.ENABLE_SYSDIG
+      run: docker build . --file ${{ env.DOCKER_FILE }} --tag ${{inputs.ARTIFACTORY_DOCKER_HOST}}/${{ env.ARTIFACTORY_FULL_DOCKER_REPO }}:${{ github.sha }}    
+    - 
+      name: Sysdig Scan
+      if: env.DOCKER_FILE!='' && contains(fromJSON('["push"]'), github.event_name) && inputs.ENABLE_SYSDIG
+      id: scan
+      uses: sysdiglabs/scan-action@v3
+      with:
+        image-tag: "${{inputs.ARTIFACTORY_DOCKER_HOST}}/${{ env.ARTIFACTORY_FULL_DOCKER_REPO }}:${{ github.sha }}"
+        sysdig-secure-url: https://us2.app.sysdig.com
+        sysdig-secure-token: ${{ secrets.SYSDIG_TOKEN }}
+        input-type: docker-daemon
+        run-as-user: root
+    -
+      name: Login to TR Jfrog
+      if: env.DOCKER_FILE!='' && contains(fromJSON('["push"]'), github.event_name)
+      uses: docker/login-action@v2
+      with:
+        registry: ${{inputs.ARTIFACTORY_DOCKER_HOST}}
+        username: ${{ secrets.ARTIFACTORY_USERNAME }}
+        password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+    -
+      name: Push Docker Image
+      if: env.DOCKER_FILE!='' && contains(fromJSON('["push"]'), github.event_name)
+      uses: docker/build-push-action@v3
+      with:
+        context: .
+        file: ${{ env.DOCKER_FILE }}
+        push: true
+        tags: ${{inputs.ARTIFACTORY_DOCKER_HOST}}/${{ env.ARTIFACTORY_FULL_DOCKER_REPO }}:${{ github.sha }},${{inputs.ARTIFACTORY_DOCKER_HOST}}/${{ env.ARTIFACTORY_FULL_DOCKER_REPO }}:latest
+      
+    -
+      name: Save Current SHA
+      if: inputs.TRIGGER_BRANCH!='' && (github.ref == env.MAIN_BRANCH_REF) && (github.event_name == 'push')
+      run: |
+        mkdir -p sha
+        echo ${{ github.sha }} > sha/git-commit.txt
+        cp ${{ inputs.ACTION_INFO_FILE_NAME}} sha
+        CODEOWNER_FILE=.github/CODEOWNERS
+        if test -f $CODEOWNER_FILE; then
+          mkdir -p sha/.github
+          cp $CODEOWNER_FILE sha/.github
+        else
+          echo "No code owner file exists"
+        fi
+    # - 
+      # name: Commit Current SHA
+      # if: inputs.TRIGGER_BRANCH!='' && (github.ref == env.MAIN_BRANCH_REF) && (github.event_name == 'push')
+      # uses: s0/git-publish-subdir-action@develop
+      # env:
+        # REPO: self
+        # BRANCH: ${{ inputs.TRIGGER_BRANCH }}
+        # FOLDER: sha
+        # GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # MESSAGE: "commit: {long-sha}. message: \n{msg}"
+    - 
+      name: Commit Current SHA
+      continue-on-error: true
+      if: inputs.TRIGGER_BRANCH!='' && (github.ref == env.MAIN_BRANCH_REF) && (github.event_name == 'push')
+      shell: bash
+      run: |
+          echo $REPO_NAME,$BRANCH,$DIRECTORY_TO_PUSH,$GITHUB_SHA
+          curl -L \
+            -H "Accept: application/vnd.github.v3.raw" \
+            -H "Authorization: Bearer ${{ secrets.IDT_GITHUB_READONLY_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/tr/a209047_osdo-cnf-cicd-workflows/contents/src/integration/publish-subdir.sh > publish-subdir.sh
+          chmod +x publish-subdir.sh
+          bash ./publish-subdir.sh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO_NAME: "tr/${{ github.event.repository.name }}"
+        BRANCH: ${{ inputs.TRIGGER_BRANCH }}
+        DIRECTORY_TO_PUSH: "sha"
+        GITHUB_SHA: ${{ github.sha }}
+    - 
+      name: Microsoft Teams Notification
+      if: inputs.MSTEAMS_WEBHOOK!='' && always()
+      uses: skitionek/notify-microsoft-teams@master
+      with:
+          webhook_url: ${{ inputs.MSTEAMS_WEBHOOK }}
+          needs: ${{ toJson(needs) }}
+          job: ${{ toJson(job) }}
+          steps: ${{ toJson(steps) }}
+    
+    -
+      name: Generate Job summary
+      if: github.event_name == 'push'
+      run: |
+        actionFile=${{ inputs.ACTION_INFO_FILE_NAME}}        
+        
+        if test -f $actionFile; 
+        then
+            tag=$(cat $actionFile| jq -r '.tag? //empty')            
+            dockerimage=$(cat $actionFile| jq -r '.dockerimage? //empty')            
+            echo "# Action Summary" >> $GITHUB_STEP_SUMMARY
+            echo "### Commit ID: $tag" >> $GITHUB_STEP_SUMMARY            
+            [ ! -z $jfrogdockerrepo ] && echo "### Jfrog Docker Repo: $jfrogdockerrepo" >> $GITHUB_STEP_SUMMARY            
+            if [ ! -z $dockerimage ]; then
+              echo "### Docker Image: $dockerimage" >> $GITHUB_STEP_SUMMARY
+            fi
+        fi
